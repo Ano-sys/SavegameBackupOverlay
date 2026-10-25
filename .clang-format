@@ -1,0 +1,21 @@
+BasedOnStyle: LLVM
+IndentWidth: 4
+ContinuationIndentWidth: 4
+UseTab: Never
+AccessModifierOffset: -4
+IndentCaseLabels: true
+BreakBeforeBraces: Custom
+BraceWrapping:
+  BeforeElse: true
+SpaceBeforeParens: Never
+PointerAlignment: Left
+ReferenceAlignment: Left
+AlignAfterOpenBracket: false
+BreakAfterOpenBracketFunction: true
+BreakBeforeCloseBracketFunction: true
+DerivePointerAlignment: false
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: AllIfsAndElse
+AllowShortLoopsOnASingleLine: true
+ColumnLimit: 0
+SortIncludes: Never

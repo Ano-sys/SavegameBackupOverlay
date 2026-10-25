@@ -1,0 +1,6 @@
+.vscode*/
+build-switch*/
+auth.json
+auth.json.tmp
+auth.json.bak
+google-oauth.local.json

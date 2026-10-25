@@ -1,0 +1,108 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Host tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ cmake libcurl4-openssl-dev libminizip-dev zlib1g-dev libssl-dev
+
+      - name: Run tests
+        run: sh tests/run_host_tests.sh
+
+  build:
+    name: Switch overlay
+    needs: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Read app version
+        id: version
+        run: cmake -DVERSION_OUTPUT="$GITHUB_OUTPUT" -P cmake/Version.cmake
+
+      - name: Build with devkitPro
+        env:
+          GOOGLE_OAUTH_CLIENT_ID: ${{ github.event_name != 'pull_request' && secrets.GOOGLE_OAUTH_CLIENT_ID || '' }}
+          GOOGLE_OAUTH_CLIENT_SECRET: ${{ github.event_name != 'pull_request' && secrets.GOOGLE_OAUTH_CLIENT_SECRET || '' }}
+          GOOGLE_OAUTH_REQUIRED: ${{ github.event_name == 'pull_request' && 'OFF' || 'ON' }}
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            --env GOOGLE_OAUTH_CLIENT_ID \
+            --env GOOGLE_OAUTH_CLIENT_SECRET \
+            --env GOOGLE_OAUTH_REQUIRED \
+            devkitpro/devkita64:20260219 \
+            bash ./build.sh
+
+      - name: Create checksum
+        working-directory: build-switch
+        run: sha256sum SavegameBackupOverlay.ovl > SavegameBackupOverlay.ovl.sha256
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: SavegameBackupOverlay-${{ steps.version.outputs.version }}
+          path: |
+            build-switch/SavegameBackupOverlay.ovl
+            build-switch/SavegameBackupOverlay.ovl.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: GitHub release
+    needs: build
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ needs.build.outputs.tag }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: SavegameBackupOverlay-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Publish new version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: bash .github/scripts/publish_release.sh "$RELEASE_VERSION" dist
