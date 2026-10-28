@@ -1,14 +1,26 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <thread>
 
 using u64 = uint64_t;
 using s64 = int64_t;
 using Result = uint32_t;
+inline void svcSleepThread(int64_t nanoseconds) { std::this_thread::sleep_for(std::chrono::nanoseconds(nanoseconds)); }
 struct AccountUid {
     u64 uid[2];
 };
+
+struct SetSysDeviceNickName {
+    char nickname[0x80];
+};
+Result setInitialize();
+void setExit();
+Result setGetDeviceNickname(SetSysDeviceNickName*);
+Result setsysInitialize();
+void setsysExit();
+Result setsysGetDeviceNickname(SetSysDeviceNickName*);
 
 enum { Module_Libnx = 345,
     LibnxError_OutOfMemory = 2 };
@@ -30,18 +42,24 @@ struct Thread {
 };
 inline unsigned test_open_threads = 0;
 inline Result test_thread_close_result = 0;
+inline Result test_thread_create_result = 0;
+inline Result test_thread_start_result = 0;
+inline unsigned test_thread_creations = 0;
 
 #define R_FAILED(result) ((result) != 0)
 #define R_SUCCEEDED(result) ((result) == 0)
 #define MAKERESULT(module, description) ((module) | ((description) << 9))
 
 inline Result threadCreate(Thread* thread, void (*entry)(void*), void* context, void*, size_t, int, int) {
+    ++test_thread_creations;
+    if(test_thread_create_result) return test_thread_create_result;
     thread->entry = entry;
     thread->context = context;
     return 0;
 }
 
 inline Result threadStart(Thread* thread) {
+    if(test_thread_start_result) return test_thread_start_result;
     thread->native = new std::thread(thread->entry, thread->context);
     ++test_open_threads;
     return 0;

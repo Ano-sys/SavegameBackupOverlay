@@ -34,6 +34,9 @@ using Directory = std::unique_ptr<DIR, int (*)(DIR*)>;
 using Json = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
 
 std::string io_error(const char* operation, const std::string& path, int code) {
+    // newlib's opendir reports ENOSR when allocating the fsdev iterator fails.
+    // No FS request was made in that case; fsdevGetLastResult would be stale.
+    if(code == ENOMEM || code == ENOSR) return filesystem_error(operation, path, code) + " Not enough memory for filesystem buffers.";
 #ifdef __SWITCH__
     // fsdev exposes its last native failure, which can predate a POSIX error.
     const Result result = fsdevGetLastResult();
@@ -210,60 +213,71 @@ bool collect(const std::string& root, const std::string& relative, std::vector<E
         return false;
     }
 
-    const auto path = join(root, relative);
-    Directory directory(opendir(path.c_str()), closedir);
+    const size_t begin = entries.size();
+    {
+        const auto path = join(root, relative);
+        Directory directory(opendir(path.c_str()), closedir);
 
-    if(!directory) {
-        const int code = errno;
-        error = io_error("Could not open save directory", path, code);
-        return false;
-    }
-
-    errno = 0;
-
-    while(dirent* entry = readdir(directory.get())) {
-        if(std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) continue;
-
-        const std::string name = relative.empty() ? entry->d_name : relative + "/" + entry->d_name;
-
-        if(!relative_path(name) || entries.size() >= MaxEntries) {
-            error = "Save has too many entries or an unsupported path.";
-            return false;
-        }
-
-        struct stat info{};
-
-        const auto entry_path = join(root, name);
-        if(lstat(entry_path.c_str(), &info) != 0) {
+        if(!directory) {
             const int code = errno;
-            error = io_error("Could not inspect save entry", entry_path, code);
+            error = io_error("Could not open save directory", path, code);
             return false;
         }
-        if(!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode)) {
-            error = "Save entry is not a regular file or directory: '" + entry_path + "'.";
-            return false;
-        }
-
-        const bool is_directory = S_ISDIR(info.st_mode);
-        const uint64_t size = is_directory ? 0 : static_cast<uint64_t>(info.st_size);
-
-        if(size > MaxSaveBytes || total > MaxSaveBytes - size) {
-            error = "Save exceeds the supported size (8 GiB).";
-            return false;
-        }
-
-        total += size;
-        entries.push_back({name, is_directory, size});
-
-        if(is_directory && !collect(root, name, entries, total, error, control, depth + 1)) return false;
 
         errno = 0;
+
+        while(dirent* entry = readdir(directory.get())) {
+            if(cancelled(control, error)) return false;
+            if(std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) continue;
+
+            const std::string name = relative.empty() ? entry->d_name : relative + "/" + entry->d_name;
+
+            if(!relative_path(name) || entries.size() >= MaxEntries) {
+                error = "Save has too many entries or an unsupported path.";
+                return false;
+            }
+
+            struct stat info{};
+
+            const auto entry_path = join(root, name);
+            if(lstat(entry_path.c_str(), &info) != 0) {
+                const int code = errno;
+                error = io_error("Could not inspect save entry", entry_path, code);
+                return false;
+            }
+            if(!S_ISDIR(info.st_mode) && !S_ISREG(info.st_mode)) {
+                error = "Save entry is not a regular file or directory: '" + entry_path + "'.";
+                return false;
+            }
+
+            const bool is_directory = S_ISDIR(info.st_mode);
+            const uint64_t size = is_directory ? 0 : static_cast<uint64_t>(info.st_size);
+
+            if(size > MaxSaveBytes || total > MaxSaveBytes - size) {
+                error = "Save exceeds the supported size (8 GiB).";
+                return false;
+            }
+
+            total += size;
+            entries.push_back({name, is_directory, size});
+            errno = 0;
+        }
+
+        if(errno != 0) {
+            const int code = errno;
+            error = io_error("Could not read save directory completely", path, code);
+            return false;
+        }
     }
 
-    if(errno != 0) {
-        const int code = errno;
-        error = io_error("Could not read save directory completely", path, code);
-        return false;
+    // Close this iterator before descending. Switch directory iterators own
+    // entry buffers, so keeping every ancestor open exhausts a small heap.
+    const size_t end = entries.size();
+    for(size_t index = begin; index < end; ++index) {
+        if(!entries[index].directory) continue;
+        // Recursion may reallocate entries; never pass a reference into it.
+        const auto child = entries[index].path;
+        if(!collect(root, child, entries, total, error, control, depth + 1)) return false;
     }
 
     return true;
@@ -367,27 +381,33 @@ bool process_tree(const std::string& root, zipFile archive, std::string& hash, s
 }
 
 bool clear_directory(const std::string& path, std::string& error) {
-    Directory directory(opendir(path.c_str()), closedir);
+    std::vector<std::string> children;
+    {
+        Directory directory(opendir(path.c_str()), closedir);
 
-    if(!directory) {
-        const int code = errno;
-        error = io_error("Could not open directory for removal", path, code);
-        return false;
-    }
-
-    errno = 0;
-
-    while(dirent* entry = readdir(directory.get())) {
-        if(std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) continue;
-        if(!remove_tree(join(path, entry->d_name), error)) return false;
+        if(!directory) {
+            const int code = errno;
+            error = io_error("Could not open directory for removal", path, code);
+            return false;
+        }
 
         errno = 0;
+
+        while(dirent* entry = readdir(directory.get())) {
+            if(std::strcmp(entry->d_name, ".") == 0 || std::strcmp(entry->d_name, "..") == 0) continue;
+            children.emplace_back(entry->d_name);
+            errno = 0;
+        }
+
+        if(errno != 0) {
+            const int code = errno;
+            error = io_error("Could not read directory for removal", path, code);
+            return false;
+        }
     }
 
-    if(errno != 0) {
-        const int code = errno;
-        error = io_error("Could not read directory for removal", path, code);
-        return false;
+    for(const auto& child : children) {
+        if(!remove_tree(join(path, child), error)) return false;
     }
 
     return true;
@@ -399,7 +419,8 @@ bool manifest(const std::string& text, const Identity& expected, std::string& ha
     Json json(cJSON_ParseWithLengthOpts(text.c_str(), text.size() + 1, nullptr, true), cJSON_Delete);
     const auto* version = cJSON_GetObjectItemCaseSensitive(json.get(), "version");
     hash = JsonHandler::string(json.get(), "save_hash");
-    return cJSON_IsNumber(version) && version->valuedouble == 1 && JsonHandler::string(json.get(), "user_id") == expected.user_id && JsonHandler::string(json.get(), "application_id") == expected.application_id && hash.size() == 64 && std::all_of(hash.begin(), hash.end(), [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+    const auto console = JsonHandler::string(json.get(), "console_name");
+    return cJSON_IsNumber(version) && version->valuedouble == 1 && JsonHandler::string(json.get(), "user_id") == expected.user_id && JsonHandler::string(json.get(), "application_id") == expected.application_id && (console.empty() || expected.console_name.empty() || console == expected.console_name) && hash.size() == 64 && std::all_of(hash.begin(), hash.end(), [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
 } // namespace
 
@@ -506,7 +527,7 @@ bool create_archive(const std::string& root, const std::string& path, const Iden
 
     if(ok) {
         Json json(cJSON_CreateObject(), cJSON_Delete);
-        ok = json && cJSON_AddNumberToObject(json.get(), "version", 1) && JsonHandler::set_string(json.get(), "user_id", identity.user_id) && JsonHandler::set_string(json.get(), "application_id", identity.application_id) && JsonHandler::set_string(json.get(), "save_hash", save_hash);
+        ok = json && cJSON_AddNumberToObject(json.get(), "version", 1) && JsonHandler::set_string(json.get(), "user_id", identity.user_id) && JsonHandler::set_string(json.get(), "application_id", identity.application_id) && JsonHandler::set_string(json.get(), "user_name", identity.user_name) && JsonHandler::set_string(json.get(), "console_name", identity.console_name) && JsonHandler::set_string(json.get(), "save_hash", save_hash);
         char* text = ok ? cJSON_PrintUnformatted(json.get()) : nullptr;
 
         if(text) {

@@ -2,6 +2,7 @@
 
 #include "BackupTypes.hpp"
 #include "RestoreGuard.hpp"
+#include "BackgroundJob.hpp"
 
 #include <switch.h>
 #include <memory>
@@ -34,7 +35,7 @@ public:
     BackupTask& operator=(const BackupTask&) = delete;
 
     void backup();
-    void list();
+    void list(std::shared_ptr<const std::vector<CloudBackup>> entries = {});
     void prepare_restore(CloudBackup entry);
     void continue_restore(RestoreChoice choice);
     void delete_backup(CloudBackup entry);
@@ -63,11 +64,7 @@ private:
     View current;
 
     std::atomic<bool> cancelled{false};
-    std::atomic<bool> finished{true};
-
-    Thread worker{};
-    bool worker_created = false;
-    Result worker_cleanup_error = 0;
+    background::Job worker;
 
     Job job = Job::List;
     CloudBackup selected;

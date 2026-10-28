@@ -22,7 +22,7 @@ namespace fs = std::filesystem;
 namespace {
 const AccountUid User{{1, 2}};
 constexpr u64 Application = 42;
-const backup::Identity Identity{"00000000000000010000000000000002", "000000000000002A", "Timo", "Test Game"};
+const backup::Identity Identity{"00000000000000010000000000000002", "000000000000002A", "Timo", "Test Game", "OLED"};
 fs::path local_save;
 int commits = 0, uploads = 0, refreshes = 0, mounts = 0, deletions = 0;
 bool fail_upload = false, fail_list = false, fail_commit = false, corrupt_download = false;
@@ -102,6 +102,8 @@ cJSON* metadata(const backup::CloudBackup& entry, const backup::Identity& identi
     auto* properties = cJSON_AddObjectToObject(file, "appProperties");
     JsonHandler::set_string(properties, "backup_format", "1");
     JsonHandler::set_string(properties, "user_id", identity.user_id);
+    JsonHandler::set_string(properties, "user_name", identity.user_name);
+    JsonHandler::set_string(properties, "console_name", identity.console_name);
     JsonHandler::set_string(properties, "application_id", identity.application_id);
     JsonHandler::set_string(properties, "save_hash", entry.save_hash);
     JsonHandler::set_string(properties, "archive_hash", entry.archive_hash);
@@ -128,7 +130,7 @@ backup::BackupTask::View wait_for_task(backup::BackupTask& task) {
     assert(!result.busy);
     task.reap_finished();
     task.reap_finished();
-    assert(test_open_threads == 0);
+    assert(test_open_threads == 1);
     return result;
 }
 
@@ -160,6 +162,7 @@ drive::HttpReply transport(const drive::HttpRequest& request, const backup::Cont
         RemoteFile file;
         file.bytes = read_file(request.upload_path);
         file.entry = {"uploaded-" + std::to_string(++uploads), JsonHandler::string(json, "name"), "2026-10-25T12:00:00Z", JsonHandler::string(properties, "save_hash"), JsonHandler::string(properties, "archive_hash"), file.bytes.size()};
+        file.entry.source = file.identity;
         cJSON_Delete(json);
         remote_files.push_back(file);
 
@@ -214,8 +217,29 @@ drive::HttpReply transport(const drive::HttpRequest& request, const backup::Cont
         auto* files = cJSON_AddArrayToObject(json, "files");
         auto* folder = cJSON_CreateObject();
         JsonHandler::set_string(folder, "id", "save-folder");
-        JsonHandler::set_string(folder, "name", request.url.find("user_id") != std::string::npos ? Identity.user_name : Identity.application_name);
+        JsonHandler::set_string(folder, "name", request.url.find("user_id") != std::string::npos ? backup::source_name(Identity) : Identity.application_name);
+        auto* properties = cJSON_AddObjectToObject(folder, "appProperties");
+        JsonHandler::set_string(properties, "user_id", Identity.user_id);
+        JsonHandler::set_string(properties, "user_name", Identity.user_name);
+        JsonHandler::set_string(properties, "console_name", Identity.console_name);
         cJSON_AddItemToArray(files, folder);
+        return {true, 200, encode_json(json), ""};
+    }
+    if(request.operation == "List backup users") {
+        auto* json = cJSON_CreateObject();
+        auto* files = cJSON_AddArrayToObject(json, "files");
+        std::set<std::string> users;
+        for(const auto& remote : remote_files) {
+            if(remote.trashed || !users.insert(remote.identity.user_id).second) continue;
+            auto* folder = cJSON_CreateObject();
+            JsonHandler::set_string(folder, "id", "user-folder-" + std::to_string(users.size()));
+            JsonHandler::set_string(folder, "name", backup::source_name(remote.identity));
+            auto* properties = cJSON_AddObjectToObject(folder, "appProperties");
+            JsonHandler::set_string(properties, "user_id", remote.identity.user_id);
+            JsonHandler::set_string(properties, "user_name", remote.identity.user_name);
+            JsonHandler::set_string(properties, "console_name", remote.identity.console_name);
+            cJSON_AddItemToArray(files, folder);
+        }
         return {true, 200, encode_json(json), ""};
     }
     if(request.method == "GET" && request.url.find("pageSize=") != std::string::npos) {
@@ -335,10 +359,18 @@ extern "C" int __wrap_mkdir(const char* path, mode_t mode) {
 }
 
 namespace drive {
-CurlSession::CurlSession() { initialized = true; }
-CurlSession::~CurlSession() = default;
 HttpReply CurlSession::request(const HttpRequest& request, const backup::Control& control) const { return transport(request, control); }
 } // namespace drive
+
+Result setInitialize() { return 0; }
+void setExit() {}
+Result setGetDeviceNickname(SetSysDeviceNickName* nickname) {
+    std::strcpy(nickname->nickname, Identity.console_name.c_str());
+    return 0;
+}
+Result setsysInitialize() { return 0; }
+void setsysExit() {}
+Result setsysGetDeviceNickname(SetSysDeviceNickName* nickname) { return setGetDeviceNickname(nickname); }
 
 Result pmdmntInitialize() { return 0; }
 void pmdmntExit() {}
@@ -352,7 +384,8 @@ Result pmdmntGetProgramId(u64* application_id, u64) {
     return 0;
 }
 
-Result fsdevMountSaveData(const char* name, u64, AccountUid) {
+Result fsdevMountSaveData(const char* name, u64 application_id, AccountUid uid) {
+    assert(application_id == Application && uid.uid[0] == User.uid[0] && uid.uid[1] == User.uid[1]);
     ++mounts;
     assert(!writable_mount && save_writers.empty());
     writable_mount = true;
@@ -363,7 +396,8 @@ Result fsdevMountSaveData(const char* name, u64, AccountUid) {
     return 0;
 }
 
-Result fsdevMountSaveDataReadOnly(const char* name, u64, AccountUid) {
+Result fsdevMountSaveDataReadOnly(const char* name, u64 application_id, AccountUid uid) {
+    assert(application_id == Application && uid.uid[0] == User.uid[0] && uid.uid[1] == User.uid[1]);
     ++mounts;
     assert(!writable_mount);
     fs::create_directory_symlink(local_save, std::string(name) + ":");
@@ -473,20 +507,13 @@ int main() {
     {
         backup::BackupTask task(User, Application, Identity.user_name, Identity.application_name);
         task.list();
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while(task.view().busy && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        assert(!task.view().busy);
-        test_thread_close_result = 77;
-        task.reap_finished();
-        assert(task.view().message.find("Could not release backup worker") != std::string::npos);
-        assert(test_open_threads == 1);
-        task.list();
-        assert(test_open_threads == 1 && !task.view().busy);
-        test_thread_close_result = 0;
-        task.reap_finished();
-        assert(test_open_threads == 0);
-        task.list();
         assert(wait_for_task(task).entries);
+        const auto creations = test_thread_creations;
+        test_thread_create_result = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+        backup::BackupTask next_page(User, Application, Identity.user_name, Identity.application_name);
+        next_page.list();
+        assert(wait_for_task(next_page).entries && test_thread_creations == creations);
+        test_thread_create_result = 0;
     }
 
     set_save("old cloud contents");
@@ -813,7 +840,78 @@ int main() {
         assert(wait_for_task(task).question && local_hash() == original && commits == previous_commits);
     }
 
+    {
+        remote_files.clear();
+        set_save("Erista save for a user with a different UID");
+        const auto foreign_hash = local_hash();
+        const backup::Identity foreign{"erista-user-uid", Identity.application_id, Identity.user_name, Identity.application_name, "Erista"};
+        std::string hash, error, archive_hash;
+        const auto archive = root / "erista.zip";
+        assert(backup::create_archive(local_save, archive, foreign, hash, error));
+        assert(backup::hash_file(archive, archive_hash, error));
+        RemoteFile file;
+        file.identity = foreign;
+        file.bytes = read_file(archive);
+        file.entry = {"erista-backup", "erista.zip", "2026-10-28T12:00:00Z", hash, archive_hash, file.bytes.size(), foreign};
+        remote_files.push_back(file);
+
+        set_save("OLED destination save must be backed up first");
+        const auto destination_hash = local_hash();
+        backup::BackupTask task(User, Application, Identity.user_name, Identity.application_name);
+        task.list();
+        const auto listed = wait_for_task(task);
+        assert(listed.entries && listed.entries->size() == 1);
+        const auto selected = listed.entries->front();
+        assert(selected.source.user_id == foreign.user_id && selected.source.console_name == "Erista");
+
+        auto wrong_game = selected;
+        wrong_game.source.application_id = "other-game";
+        task.prepare_restore(wrong_game);
+        assert(wait_for_task(task).message.find("different game") != std::string::npos);
+        assert(local_hash() == destination_hash);
+
+        task.prepare_restore(selected);
+        assert(wait_for_task(task).question && local_hash() == destination_hash);
+        const auto previous_uploads = uploads;
+        task.continue_restore(backup::RestoreChoice::BackupFirst);
+        const auto restored = wait_for_task(task);
+        assert(!restored.question && local_hash() == foreign_hash && uploads == previous_uploads + 1);
+        assert(remote_files.back().identity.user_id == Identity.user_id);
+        assert(remote_files.back().entry.source.console_name == "OLED");
+        assert(backup::extract_archive(restored.recovery_path, root / "oled-recovery", Identity, destination_hash, error));
+
+        // The same explicit source also scopes deletion to the foreign backup.
+        task.delete_backup(selected);
+        assert(wait_for_task(task).deleted && remote_files.front().trashed && !remote_files.back().trashed);
+    }
+
+    {
+        // Opening the source user's save list must work even when another
+        // background stack cannot be allocated. It shares the loaded snapshot.
+        auto entries = std::make_shared<const std::vector<backup::CloudBackup>>(std::vector<backup::CloudBackup>{remote_files.back().entry});
+        const auto creations = test_thread_creations;
+        const auto previous_mounts = mounts;
+        test_thread_create_result = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+        backup::BackupTask task(User, Application, Identity.user_name, Identity.application_name);
+        task.list(entries);
+        const auto cached = task.view();
+        assert(!cached.busy && cached.entries == entries);
+        assert(cached.message == "Select a cloud backup.");
+        assert(test_thread_creations == creations && test_open_threads == 1 && mounts == previous_mounts);
+
+        // Refresh and backup keep working with no capacity for a new stack.
+        task.list();
+        assert(wait_for_task(task).entries);
+        task.backup();
+        assert(wait_for_task(task).message == "Backup uploaded to Google Drive.");
+        assert(test_thread_creations == creations && test_open_threads == 1);
+        test_thread_create_result = 0;
+    }
+
+    std::string worker_error;
+    assert(background::shutdown(worker_error) && test_open_threads == 0);
+
     fs::current_path(previous);
     fs::remove_all(root);
-    std::puts("Backup/restore/delete worker, hash prompts, pagination, token refresh, scoped deletion, cancellation, rechecks, and rollback passed.");
+    std::puts("Shared worker survives failed stack allocation, cached lists, cross-console restore, backup, deletion, recovery, cancellation, and rollback passed.");
 }

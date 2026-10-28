@@ -66,6 +66,19 @@ bool valid_hash(const std::string& hash) {
     return hash.size() == 64 && std::all_of(hash.begin(), hash.end(), [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
 
+std::string console_name(const cJSON* properties) {
+    return JsonHandler::string(properties, "console_name") + JsonHandler::string(properties, "console_name_tail");
+}
+
+bool set_console_name(cJSON* properties, const std::string& name) {
+    // Drive permits 124 UTF-8 bytes per key/value pair. A Switch nickname can
+    // occupy 127 bytes, so retain its tail in a second property without
+    // splitting a UTF-8 character between properties.
+    size_t split = std::min<size_t>(112, name.size());
+    while(split < name.size() && split > 0 && (static_cast<unsigned char>(name[split]) & 0xc0) == 0x80) --split;
+    return JsonHandler::set_string(properties, "console_name", name.substr(0, split)) && JsonHandler::set_string(properties, "console_name_tail", name.substr(split));
+}
+
 bool read_backup(const cJSON* file, const backup::Identity& identity, backup::CloudBackup& out) {
     const auto* properties = cJSON_GetObjectItemCaseSensitive(file, "appProperties");
     out.id = JsonHandler::string(file, "id");
@@ -73,6 +86,11 @@ bool read_backup(const cJSON* file, const backup::Identity& identity, backup::Cl
     out.created_time = JsonHandler::string(file, "createdTime");
     out.save_hash = JsonHandler::string(properties, "save_hash");
     out.archive_hash = JsonHandler::string(properties, "archive_hash");
+    out.source = identity;
+    const auto user_name = JsonHandler::string(properties, "user_name");
+    const auto console = console_name(properties);
+    if(!user_name.empty()) out.source.user_name = user_name;
+    if(!console.empty()) out.source.console_name = console;
     const std::string size = JsonHandler::string(file, "size");
     const auto converted = std::from_chars(size.data(), size.data() + size.size(), out.size);
     return valid_id(out.id) && !out.name.empty() && !out.created_time.empty() && valid_hash(out.save_hash) && valid_hash(out.archive_hash) && converted.ec == std::errc{} && converted.ptr == size.data() + size.size() && out.size > 0 && out.size <= backup::MaxArchiveBytes && JsonHandler::string(properties, "backup_format") == "1" && JsonHandler::string(properties, "user_id") == identity.user_id && JsonHandler::string(properties, "application_id") == identity.application_id;
@@ -88,6 +106,13 @@ std::string quoted(const std::string& value) {
     }
 
     return out + "'";
+}
+
+bool source_properties(cJSON* metadata, const backup::Identity* source) {
+    if(!source) return true;
+    auto* properties = cJSON_GetObjectItemCaseSensitive(metadata, "appProperties");
+    if(!properties) properties = cJSON_AddObjectToObject(metadata, "appProperties");
+    return properties && JsonHandler::set_string(properties, "user_id", source->user_id) && JsonHandler::set_string(properties, "user_name", source->user_name) && set_console_name(properties, source->console_name);
 }
 } // namespace
 
@@ -170,14 +195,14 @@ bool DriveStorage::request(HttpRequest request, HttpReply& out, std::string& err
     return false;
 }
 
-bool DriveStorage::folder(const std::string& parent, const std::string& name, bool create, std::string& out, std::string& error, const std::string& property, const std::string& value) {
+bool DriveStorage::folder(const std::string& parent, const std::string& name, bool create, std::string& out, std::string& error, const std::string& property, const std::string& value, const backup::Identity* source) {
     out.clear();
     const std::string selector = property.empty() ? "name = " + quoted(name) : "appProperties has { key = " + quoted(property) + " and value = " + quoted(value) + " }";
     const std::string query = "trashed = false and mimeType = 'application/vnd.google-apps.folder' and " + quoted(parent) + " in parents and " + selector;
     HttpReply reply;
     HttpRequest lookup;
     lookup.operation = "Find backup folder";
-    lookup.url = std::string(Files) + "?pageSize=100&fields=files(id,name),nextPageToken,incompleteSearch&q=" + form_encode(query);
+    lookup.url = std::string(Files) + "?pageSize=100&fields=files(id,name,appProperties),nextPageToken,incompleteSearch&q=" + form_encode(query);
 
     if(!request(lookup, reply, error)) return false;
 
@@ -203,11 +228,13 @@ bool DriveStorage::folder(const std::string& parent, const std::string& name, bo
             return false;
         }
 
-        if(!create || property.empty() || JsonHandler::string(file, "name") == name) return true;
+        const auto* properties = cJSON_GetObjectItemCaseSensitive(file, "appProperties");
+        const bool source_matches = !source || (JsonHandler::string(properties, "user_name") == source->user_name && console_name(properties) == source->console_name);
+        if(!create || property.empty() || (JsonHandler::string(file, "name") == name && source_matches)) return true;
 
         Json metadata(cJSON_CreateObject(), cJSON_Delete);
 
-        if(!metadata || !JsonHandler::set_string(metadata.get(), "name", name)) {
+        if(!metadata || !JsonHandler::set_string(metadata.get(), "name", name) || !source_properties(metadata.get(), source)) {
             error = "Could not prepare Drive folder name.";
             return false;
         }
@@ -248,6 +275,11 @@ bool DriveStorage::folder(const std::string& parent, const std::string& name, bo
         }
     }
 
+    if(!source_properties(metadata.get(), source)) {
+        error = "Could not prepare Drive user and Switch metadata.";
+        return false;
+    }
+
     HttpRequest post;
     post.operation = "Create backup folder";
     post.method = "POST";
@@ -269,8 +301,8 @@ bool DriveStorage::folder(const std::string& parent, const std::string& name, bo
 bool DriveStorage::save_folder(const backup::Identity& identity, bool create, std::string& out, std::string& error) {
     out.clear();
 
-    if(identity.user_name.empty() || identity.application_name.empty() || identity.user_name.find('\0') != std::string::npos || identity.application_name.find('\0') != std::string::npos) {
-        error = "Switch user name or game title is missing or invalid.";
+    if(identity.user_name.empty() || identity.application_name.empty() || identity.user_name.find('\0') != std::string::npos || identity.application_name.find('\0') != std::string::npos || identity.console_name.find('\0') != std::string::npos || identity.console_name.size() > 127) {
+        error = "Switch user name, console name or game title is missing or invalid.";
         return false;
     }
 
@@ -284,7 +316,8 @@ bool DriveStorage::save_folder(const backup::Identity& identity, bool create, st
 
     std::string user, application;
 
-    if(!folder(current, identity.user_name, create, user, error, "user_id", identity.user_id)) return false;
+    const auto user_name = identity.console_name.empty() ? identity.user_name : backup::source_name(identity);
+    if(!folder(current, user_name, create, user, error, "user_id", identity.user_id, &identity)) return false;
     if(user.empty()) return true;
     if(!folder(user, identity.application_name, create, application, error, "application_id", identity.application_id)) return false;
     if(application.empty()) return true;
@@ -299,6 +332,70 @@ bool DriveStorage::list(const backup::Identity& identity, std::vector<backup::Cl
     if(!save_folder(identity, false, parent, error)) return false;
     if(parent.empty()) return true;
 
+    return list_folder(identity, parent, out, error);
+}
+
+bool DriveStorage::list_game(const backup::Identity& identity, std::vector<backup::CloudBackup>& out, std::string& error) {
+    out.clear();
+    std::string root = root_id;
+    if(root.empty() && !folder("root", "SwitchSavegames", false, root, error)) return false;
+    if(root.empty()) return true;
+
+    const auto query = quoted(root) + " in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'";
+    std::string page;
+    std::set<std::string> pages, folders, ids;
+    do {
+        if(!pages.insert(page).second || pages.size() > 1000) {
+            error = "Invalid Drive user pagination.";
+            return false;
+        }
+        HttpRequest get;
+        get.operation = "List backup users";
+        get.url = std::string(Files) + "?pageSize=100&fields=" + form_encode("nextPageToken,incompleteSearch,files(id,name,appProperties)") + "&q=" + form_encode(query);
+        if(!page.empty()) get.url += "&pageToken=" + form_encode(page);
+        HttpReply reply;
+        if(!request(get, reply, error)) return false;
+        const auto json = parse(reply.body);
+        const auto* files = cJSON_GetObjectItemCaseSensitive(json.get(), "files");
+        if(!cJSON_IsArray(files) || cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(json.get(), "incompleteSearch"))) {
+            error = "Could not read the complete Drive user list.";
+            return false;
+        }
+        const cJSON* file;
+        cJSON_ArrayForEach(file, files) {
+            const auto* properties = cJSON_GetObjectItemCaseSensitive(file, "appProperties");
+            backup::Identity source;
+            source.user_id = JsonHandler::string(properties, "user_id");
+            if(source.user_id.empty()) continue; // Ignore old ID-named test folders.
+            const auto folder_id = JsonHandler::string(file, "id");
+            if(!valid_id(folder_id)) {
+                error = "Google Drive returned an invalid user folder ID.";
+                return false;
+            }
+            if(!folders.insert(folder_id).second) continue;
+            source.application_id = identity.application_id;
+            source.application_name = identity.application_name;
+            source.user_name = JsonHandler::string(properties, "user_name");
+            source.console_name = console_name(properties);
+            if(source.user_name.empty()) source.user_name = JsonHandler::string(file, "name");
+
+            std::string application, saves;
+            if(!folder(folder_id, identity.application_name, false, application, error, "application_id", identity.application_id)) return false;
+            if(application.empty()) continue;
+            if(!folder(application, "Savegames", false, saves, error)) return false;
+            if(saves.empty()) continue;
+            std::vector<backup::CloudBackup> entries;
+            if(!list_folder(source, saves, entries, error)) return false;
+            for(auto& entry : entries) {
+                if(ids.insert(entry.id).second) out.push_back(std::move(entry));
+            }
+        }
+        page = JsonHandler::string(json.get(), "nextPageToken");
+    } while(!page.empty());
+    return true;
+}
+
+bool DriveStorage::list_folder(const backup::Identity& identity, const std::string& parent, std::vector<backup::CloudBackup>& out, std::string& error) {
     const std::string query = quoted(parent) + " in parents and trashed = false and mimeType = 'application/zip'";
     std::string page;
     std::set<std::string> pages, ids;
@@ -361,7 +458,7 @@ bool DriveStorage::upload(const backup::Identity& identity, const std::string& p
     auto* parents = cJSON_AddArrayToObject(metadata.get(), "parents");
     auto* properties = cJSON_AddObjectToObject(metadata.get(), "appProperties");
 
-    if(!metadata || !parents || !properties || !cJSON_AddItemToArray(parents, cJSON_CreateString(parent.c_str())) || !JsonHandler::set_string(metadata.get(), "name", name) || !JsonHandler::set_string(metadata.get(), "mimeType", "application/zip") || !JsonHandler::set_string(properties, "backup_format", "1") || !JsonHandler::set_string(properties, "user_id", identity.user_id) || !JsonHandler::set_string(properties, "application_id", identity.application_id) || !JsonHandler::set_string(properties, "save_hash", save_hash) || !JsonHandler::set_string(properties, "archive_hash", archive_hash)) {
+    if(!metadata || !parents || !properties || !cJSON_AddItemToArray(parents, cJSON_CreateString(parent.c_str())) || !JsonHandler::set_string(metadata.get(), "name", name) || !JsonHandler::set_string(metadata.get(), "mimeType", "application/zip") || !JsonHandler::set_string(properties, "backup_format", "1") || !source_properties(metadata.get(), &identity) || !JsonHandler::set_string(properties, "application_id", identity.application_id) || !JsonHandler::set_string(properties, "save_hash", save_hash) || !JsonHandler::set_string(properties, "archive_hash", archive_hash)) {
         error = "Could not prepare backup metadata.";
         return false;
     }

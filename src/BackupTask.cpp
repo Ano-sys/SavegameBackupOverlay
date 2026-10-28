@@ -13,7 +13,28 @@
 
 namespace backup {
 namespace {
-std::mutex operation_mutex;
+
+bool read_console_name(std::string& name, std::string& error) {
+    SetSysDeviceNickName nickname{};
+    Result rc = setInitialize();
+    if(R_SUCCEEDED(rc)) {
+        rc = setGetDeviceNickname(&nickname);
+        setExit();
+    }
+    if(R_FAILED(rc)) {
+        rc = setsysInitialize();
+        if(R_SUCCEEDED(rc)) {
+            rc = setsysGetDeviceNickname(&nickname);
+            setsysExit();
+        }
+    }
+    if(R_SUCCEEDED(rc)) name.assign(nickname.nickname, strnlen(nickname.nickname, sizeof(nickname.nickname)));
+    if(R_FAILED(rc) || name.empty()) {
+        error = "Could not read the Switch name (" + std::to_string(rc) + "). Set a console nickname in System Settings.";
+        return false;
+    }
+    return true;
+}
 
 bool game_closed(u64 application_id, std::string& error) {
     Result rc = pmdmntInitialize();
@@ -190,10 +211,7 @@ BackupTask::BackupTask(AccountUid uid, u64 application_id, std::string user_name
 BackupTask::~BackupTask() {
     cancel();
 
-    if(worker_created) {
-        threadWaitForExit(&worker);
-        threadClose(&worker);
-    }
+    worker.wait();
 }
 
 BackupTask::View BackupTask::view() const {
@@ -226,8 +244,17 @@ void BackupTask::backup() {
     if(!view().busy) start(Job::Backup);
 }
 
-void BackupTask::list() {
-    if(!view().busy) start(Job::List);
+void BackupTask::list(std::shared_ptr<const std::vector<CloudBackup>> entries) {
+    if(view().busy) return;
+    if(!entries) {
+        start(Job::List);
+        return;
+    }
+    worker.wait();
+    std::lock_guard lock(mutex);
+    current = {};
+    current.entries = std::move(entries);
+    current.message = current.entries->empty() ? "No backups on Google Drive." : "Select a cloud backup.";
 }
 
 void BackupTask::prepare_restore(CloudBackup entry) {
@@ -257,16 +284,14 @@ void BackupTask::delete_backup(CloudBackup entry) {
 }
 
 void BackupTask::start(Job next) {
-    if(worker_created && !finished.load()) return;
-    reap_finished();
-    if(worker_created) return;
-    log_memory(next == Job::Backup ? "before backup worker" : next == Job::List ? "before list worker"
-                                                          : next == Job::Delete ? "before delete worker"
-                                                                                : "before restore worker");
+    if(view().busy) return;
+    worker.wait();
+    log_memory(next == Job::Backup ? "before backup job" : next == Job::List ? "before list job"
+                                                       : next == Job::Delete ? "before delete job"
+                                                                             : "before restore job");
 
     job = next;
     cancelled.store(false);
-    finished.store(false);
     {
         std::lock_guard lock(mutex);
         current.busy = true;
@@ -276,53 +301,22 @@ void BackupTask::start(Job next) {
         current.done = current.total = 0;
     }
 
-    Result rc = threadCreate(&worker, thread_entry, this, nullptr, 0x20000, 0x2C, -2);
-
-    if(R_SUCCEEDED(rc)) {
-        worker_created = true;
-        rc = threadStart(&worker);
-
-        if(R_FAILED(rc)) {
-            threadClose(&worker);
-            worker_created = false;
-        }
-    }
-
-    if(R_FAILED(rc)) {
+    std::string error;
+    if(!worker.start(thread_entry, this, error)) {
+        log_error(error);
         std::lock_guard lock(mutex);
         current.busy = false;
-        current.message = "Could not start backup worker.";
-        finished.store(true);
+        current.message = error;
     }
 }
 
 void BackupTask::reap_finished() {
-    if(!worker_created || !finished.load()) return;
-
-    Result result = threadWaitForExit(&worker);
-    if(R_SUCCEEDED(result)) result = threadClose(&worker);
-
-    if(R_FAILED(result)) {
-        const auto message = "Could not release backup worker (Result " + std::to_string(result) + ").";
-        if(worker_cleanup_error != result) {
-            log_error(message);
-            log_memory("after failed worker release");
-        }
-        worker_cleanup_error = result;
-        std::lock_guard lock(mutex);
-        current.message = message;
-        return;
-    }
-
-    worker_cleanup_error = 0;
-    worker_created = false;
-    log_memory("after worker release");
+    if(worker.reap()) log_memory("after shared worker job");
 }
 
 void BackupTask::thread_entry(void* context) { static_cast<BackupTask*>(context)->run(); }
 
 void BackupTask::run() {
-    std::unique_lock operation(operation_mutex);
     std::string error;
     const bool ok = execute(error);
     log_memory("after operation cleanup");
@@ -338,7 +332,6 @@ void BackupTask::run() {
 
         current.busy = current.critical = false;
         current.done = current.total = 0;
-        finished.store(true);
     }
 }
 
@@ -350,12 +343,9 @@ bool BackupTask::execute(std::string& error) {
         return false;
     }
 
-    drive::CurlSession network;
+    if(!read_console_name(identity.console_name, error)) return false;
 
-    if(!network.ready()) {
-        error = network.error().empty() ? "Could not initialize network." : network.error();
-        return false;
-    }
+    drive::CurlSession network;
 
     drive::GoogleDriveConfig config;
     drive::DriveStorage storage(config, [&](const drive::HttpRequest& request, const Control& transfer) { return network.request(request, transfer); }, control);
@@ -365,7 +355,7 @@ bool BackupTask::execute(std::string& error) {
         auto entries = std::make_shared<std::vector<CloudBackup>>();
         report("Loading Google Drive backups ...");
 
-        if(!storage.list(identity, *entries, error)) return false;
+        if(!storage.list_game(identity, *entries, error)) return false;
 
         std::lock_guard lock(mutex);
         current.entries = entries;
@@ -374,7 +364,12 @@ bool BackupTask::execute(std::string& error) {
     }
 
     if(job == Job::Delete) {
-        if(!storage.trash_backup(identity, selected, error)) return false;
+        const auto& source = selected.source.user_id.empty() ? identity : selected.source;
+        if(source.application_id != identity.application_id) {
+            error = "Selected backup belongs to a different game.";
+            return false;
+        }
+        if(!storage.trash_backup(source, selected, error)) return false;
 
         std::lock_guard lock(mutex);
         current.deleted = true;
@@ -411,19 +406,28 @@ bool BackupTask::execute(std::string& error) {
         return true;
     }
 
-    std::vector<CloudBackup> backups;
+    const auto& source = selected.source.user_id.empty() ? identity : selected.source;
+    if(source.application_id != identity.application_id) {
+        error = "Selected backup belongs to a different game.";
+        return false;
+    }
+    std::vector<CloudBackup> source_backups;
     report("Checking Google Drive backups ...");
 
-    if(!storage.list(identity, backups, error)) return false;
+    if(!storage.list(source, source_backups, error)) return false;
 
-    const auto target = std::find_if(backups.begin(), backups.end(), [&](const CloudBackup& entry) { return entry.id == selected.id; });
+    const auto target = std::find_if(source_backups.begin(), source_backups.end(), [&](const CloudBackup& entry) { return entry.id == selected.id; });
 
-    if(target == backups.end()) {
+    if(target == source_backups.end()) {
         error = "Selected backup is no longer available. Refresh the list.";
         return false;
     }
 
     const CloudBackup restore = *target;
+    std::vector<CloudBackup> backups;
+    // The safety prompt checks the destination user's backups, even when the
+    // selected archive belongs to another user or console.
+    if(!storage.list(identity, backups, error)) return false;
     std::string current_hash;
     {
         SaveMount save;
@@ -439,7 +443,7 @@ bool BackupTask::execute(std::string& error) {
     const auto downloaded = workspace.path + "/download.zip";
     const auto staging = workspace.path + "/restore";
 
-    if(!storage.download(restore, downloaded, error) || !extract_archive(downloaded, staging, identity, restore.save_hash, error, control)) return false;
+    if(!storage.download(restore, downloaded, error) || !extract_archive(downloaded, staging, restore.source, restore.save_hash, error, control)) return false;
 
     std::string recovery, snapshot_hash, verified;
 

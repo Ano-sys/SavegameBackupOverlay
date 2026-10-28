@@ -1,7 +1,9 @@
 #include "include/SaveArchive.hpp"
 #include "include/RestoreGuard.hpp"
+#include "include/JsonHandler.hpp"
 
 #include <minizip/zip.h>
+#include <minizip/unzip.h>
 #include <cassert>
 #include <cerrno>
 #include <cstring>
@@ -10,6 +12,8 @@
 #include <cstdio>
 #include <vector>
 #include <string_view>
+#include <dirent.h>
+#include <set>
 
 namespace fs = std::filesystem;
 
@@ -29,6 +33,8 @@ RestoreFailure restore_failure = RestoreFailure::None;
 std::string restore_prefix, blocked_remove;
 FILE* restore_output = nullptr;
 uint64_t simulated_write_limit = 0, uncommitted_bytes = 0;
+size_t directory_limit = 1, peak_directories = 0;
+std::set<DIR*> open_directories;
 
 void write_file(const fs::path& path, const std::string& contents) {
     fs::create_directories(path.parent_path());
@@ -55,6 +61,26 @@ void make_zip(const fs::path& path, const std::vector<std::pair<std::string, std
     assert(zipClose(archive, nullptr) == ZIP_OK);
 }
 } // namespace
+
+extern "C" DIR* __real_opendir(const char*);
+extern "C" DIR* __wrap_opendir(const char* path) {
+    if(open_directories.size() >= directory_limit) {
+        errno = ENOSR;
+        return nullptr;
+    }
+    DIR* directory = __real_opendir(path);
+    if(directory) {
+        open_directories.insert(directory);
+        peak_directories = std::max(peak_directories, open_directories.size());
+    }
+    return directory;
+}
+
+extern "C" int __real_closedir(DIR*);
+extern "C" int __wrap_closedir(DIR* directory) {
+    assert(open_directories.erase(directory) == 1);
+    return __real_closedir(directory);
+}
 
 extern "C" FILE* __real_fopen(const char*, const char*);
 extern "C" FILE* __wrap_fopen(const char* path, const char* mode) {
@@ -170,8 +196,12 @@ int main() {
     fs::create_directories(save / "empty");
     write_file(save / "nested/binary", std::string("a\0b\xff", 4));
     write_file(save / "slot", std::string(50000, 's'));
-    const backup::Identity identity{"test-user", "test-game"};
+    const backup::Identity identity{"test-user", "test-game", "Timo", "Test Game", "Erista"};
     std::string hash, other, error;
+    directory_limit = 0;
+    assert(!backup::hash_save(save, hash, error));
+    assert(error.find("filesystem buffers") != std::string::npos && open_directories.empty());
+    directory_limit = 1;
     assert(backup::hash_save(save, hash, error));
     assert(hash.size() == 64);
     fs::last_write_time(save / "slot", fs::file_time_type::clock::now());
@@ -188,6 +218,16 @@ int main() {
 
     const auto archive = root / "backup.zip";
     assert(backup::create_archive(save, archive, identity, other, error) && other == hash);
+    unzFile zip = unzOpen64(archive.c_str());
+    assert(zip && unzLocateFile(zip, "manifest.json", 1) == UNZ_OK && unzOpenCurrentFile(zip) == UNZ_OK);
+    char manifest[2048]{};
+    const int length = unzReadCurrentFile(zip, manifest, sizeof(manifest) - 1);
+    assert(length > 0 && unzCloseCurrentFile(zip) == UNZ_OK && unzClose(zip) == UNZ_OK);
+    auto* metadata = cJSON_Parse(manifest);
+    assert(JsonHandler::string(metadata, "user_id") == identity.user_id);
+    assert(JsonHandler::string(metadata, "user_name") == identity.user_name);
+    assert(JsonHandler::string(metadata, "console_name") == "Erista");
+    cJSON_Delete(metadata);
     std::string archive_hash;
     assert(backup::hash_file(archive, archive_hash, error));
     assert(backup::extract_archive(archive, root / "staged", identity, hash, error));
@@ -198,6 +238,14 @@ int main() {
     assert(!fs::exists(save / "extra"));
     assert(backup::hash_save(save, other, error) && other == hash);
     assert(!backup::extract_archive(archive, root / "wrong-user", {"other", "test-game"}, hash, error));
+    assert(!backup::extract_archive(archive, root / "wrong-game", {"test-user", "other-game"}, hash, error));
+    auto wrong_console = identity;
+    wrong_console.console_name = "OLED";
+    assert(!backup::extract_archive(archive, root / "wrong-console", wrong_console, hash, error));
+    auto legacy = identity;
+    legacy.console_name.clear();
+    assert(backup::create_archive(save, root / "legacy.zip", legacy, other, error));
+    assert(backup::extract_archive(root / "legacy.zip", root / "legacy", identity, other, error));
     assert(!backup::extract_archive(archive, root / "wrong-hash", identity, std::string(64, '0'), error));
 
     for(const auto& name : {"save/../escaped", "save//escaped", "save/./escaped", "/escaped", "save/C:escaped", "save/dir\\escaped"}) {
@@ -364,6 +412,23 @@ int main() {
     assert(backup::restore_action("changed", {}, RestoreChoice::WithoutBackup, hash) == RestoreAction::Ask);
     assert(backup::restore_action("changed", {}, RestoreChoice::BackupFirst, hash) == RestoreAction::Ask);
 
+    // Mimic the small Switch heap: hashing, ZIP creation/extraction, restore and
+    // cleanup must work with only one directory iterator, even in deep trees.
+    const auto deep = root / "deep";
+    write_file(deep / "0/1/2/3/4/slot", "nested save");
+    fs::create_directories(deep / "2/empty");
+    std::string deep_hash, verified;
+    assert(backup::create_archive(deep, root / "deep.zip", identity, deep_hash, error));
+    assert(backup::extract_archive(root / "deep.zip", root / "deep-staged", identity, deep_hash, error));
+    const auto deep_destination = root / "deep-destination";
+    write_file(deep_destination / "old/nested/slot", "previous save");
+    assert(backup::replace_save(deep_destination, root / "deep-staged/save", error));
+    assert(backup::hash_save(deep_destination, verified, error) && verified == deep_hash);
+    assert(backup::remove_tree(deep_destination, error));
+    assert(backup::remove_tree(deep, error));
+    assert(backup::remove_tree(root / "deep-staged", error));
+    assert(!fs::exists(deep_destination) && open_directories.empty() && peak_directories == 1);
+
     fs::remove_all(root);
-    std::puts("Save hashing, ZIP diagnostics, restore I/O diagnostics, cleanup, and restore decisions passed.");
+    std::puts("Single-iterator directory traversal, deep saves, ZIP validation, restore I/O, cleanup, and restore decisions passed.");
 }

@@ -7,6 +7,7 @@ BackupMenuGui::BackupMenuGui(AccountUid uid, u64 application_id, std::string use
 tsl::elm::Element* BackupMenuGui::createUI() {
     auto* frame = new tsl::elm::OverlayFrame("Cloud Backup", name);
     auto* list = new tsl::elm::List();
+    list->addItem(new tsl::elm::CategoryHeader(backup::source_name(entry.source)));
     std::string date = entry.created_time.substr(0, 19);
 
     if(date.size() > 10 && date[10] == 'T') date[10] = ' ';

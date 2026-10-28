@@ -16,7 +16,12 @@ struct Identity {
     std::string application_id;
     std::string user_name{};
     std::string application_name{};
+    std::string console_name{};
 };
+
+inline std::string source_name(const Identity& identity) {
+    return (identity.user_name.empty() ? identity.user_id : identity.user_name) + " - " + (identity.console_name.empty() ? "Unknown Switch" : identity.console_name);
+}
 
 struct CloudBackup {
     std::string id;
@@ -25,6 +30,7 @@ struct CloudBackup {
     std::string save_hash;
     std::string archive_hash;
     uint64_t size = 0;
+    Identity source{};
 };
 
 struct Control {
