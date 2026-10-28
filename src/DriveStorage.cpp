@@ -197,8 +197,8 @@ bool DriveStorage::request(HttpRequest request, HttpReply& out, std::string& err
 
 bool DriveStorage::folder(const std::string& parent, const std::string& name, bool create, std::string& out, std::string& error, const std::string& property, const std::string& value, const backup::Identity* source) {
     out.clear();
-    const std::string selector = property.empty() ? "name = " + quoted(name) : "appProperties has { key = " + quoted(property) + " and value = " + quoted(value) + " }";
-    const std::string query = "trashed = false and mimeType = 'application/vnd.google-apps.folder' and " + quoted(parent) + " in parents and " + selector;
+    const std::string selector = property.empty() ? "name = " + drive::quoted(name) : "appProperties has { key = " + drive::quoted(property) + " and value = " + drive::quoted(value) + " }";
+    const std::string query = "trashed = false and mimeType = 'application/vnd.google-apps.folder' and " + drive::quoted(parent) + " in parents and " + selector;
     HttpReply reply;
     HttpRequest lookup;
     lookup.operation = "Find backup folder";
@@ -341,7 +341,7 @@ bool DriveStorage::list_game(const backup::Identity& identity, std::vector<backu
     if(root.empty() && !folder("root", "SwitchSavegames", false, root, error)) return false;
     if(root.empty()) return true;
 
-    const auto query = quoted(root) + " in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'";
+    const auto query = drive::quoted(root) + " in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'";
     std::string page;
     std::set<std::string> pages, folders, ids;
     do {
@@ -396,7 +396,7 @@ bool DriveStorage::list_game(const backup::Identity& identity, std::vector<backu
 }
 
 bool DriveStorage::list_folder(const backup::Identity& identity, const std::string& parent, std::vector<backup::CloudBackup>& out, std::string& error) {
-    const std::string query = quoted(parent) + " in parents and trashed = false and mimeType = 'application/zip'";
+    const std::string query = drive::quoted(parent) + " in parents and trashed = false and mimeType = 'application/zip'";
     std::string page;
     std::set<std::string> pages, ids;
     do {
