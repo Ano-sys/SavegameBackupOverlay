@@ -1,6 +1,7 @@
 #pragma once
 
 #include "GoogleDriveConfig.hpp"
+#include "BackgroundJob.hpp"
 
 #include <switch.h>
 #include <atomic>
@@ -51,11 +52,7 @@ private:
     View current;
 
     std::atomic<bool> cancelled{false};
-    std::atomic<bool> finished{true};
-
-    Thread worker{};
-
-    bool worker_created = false;
+    background::Job worker;
     bool connecting = false;
     bool disconnect_requested = false;
 };

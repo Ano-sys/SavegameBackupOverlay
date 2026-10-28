@@ -10,6 +10,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <sys/socket.h>
 
 namespace {
@@ -20,6 +23,10 @@ bool simulate_socket_failure = false;
 int simulated_open_errno = EMFILE;
 unsigned handles_created = 0;
 int request_marker = 0;
+std::mutex request_mutex;
+std::condition_variable request_wake;
+bool hold_request = false, request_entered = false, release_request = false;
+unsigned active_requests = 0, peak_requests = 0;
 } // namespace
 
 extern "C" CURL* __real_curl_easy_init();
@@ -44,6 +51,18 @@ extern "C" CURLcode __wrap_curl_easy_perform(CURL* handle) {
     assert(__real_curl_easy_getinfo(handle, CURLINFO_PRIVATE, &previous_marker) == CURLE_OK);
     assert(previous_marker == nullptr);
     assert(curl_easy_setopt(handle, CURLOPT_PRIVATE, &request_marker) == CURLE_OK);
+    {
+        std::unique_lock lock(request_mutex);
+        if(hold_request) {
+            ++active_requests;
+            peak_requests = std::max(peak_requests, active_requests);
+            request_entered = true;
+            request_wake.notify_all();
+            request_wake.wait(lock, [] { return release_request; });
+            --active_requests;
+            return CURLE_OK;
+        }
+    }
     return simulate_connect_failure ? CURLE_COULDNT_CONNECT : __real_curl_easy_perform(handle);
 }
 
@@ -67,7 +86,7 @@ int main() {
     const fs::path root(directory);
 
     drive::CurlSession session;
-    assert(session.ready());
+    assert(handles_created == 0);
     drive::HttpRequest request;
     request.url = "https://www.googleapis.com/upload/?upload_id=private-session";
     request.upload_path = (root / "missing.zip").string();
@@ -81,6 +100,7 @@ int main() {
     request.download_path = (root / "missing/destination.zip").string();
     reply = session.request(request, {});
     assert(!reply.transport_ok && reply.error.find("Open download file") != std::string::npos);
+    assert(handles_created == 0);
 
     // The rejected protocol produces a real curl error without network access.
     request.download_path.clear();
@@ -122,6 +142,51 @@ int main() {
     assert(reply.error.find("socket() failed without reporting errno") != std::string::npos);
     simulate_socket_failure = false;
     assert(handles_created == 1);
+
+    // New operation objects must retain the same shared easy handle/cache.
+    {
+        drive::CurlSession next_operation;
+        request.url = "file:///unused";
+        reply = next_operation.request(request, {});
+        assert(!reply.transport_ok && handles_created == 1);
+    }
+    assert(!drive::CurlSession::expire_idle());
+    assert(drive::CurlSession::expire_idle(std::chrono::steady_clock::now() + drive::CurlSession::IdleTimeout + std::chrono::seconds(1)));
+    assert(!drive::CurlSession::expire_idle());
+    reply = session.request(request, {});
+    assert(!reply.transport_ok && handles_created == 2);
+
+    // Expiry must not close an active request. Other operation objects wait
+    // for that request, and cancellation can interrupt the wait.
+    request.url = "https://example.test/serialized";
+    hold_request = true;
+    std::thread first([&] { session.request(request, {}); });
+    {
+        std::unique_lock lock(request_mutex);
+        assert(request_wake.wait_for(lock, std::chrono::seconds(5), [] { return request_entered; }));
+    }
+    assert(!drive::CurlSession::expire_idle(std::chrono::steady_clock::now() + std::chrono::hours(1)));
+    std::atomic<bool> queued_cancel{false};
+    std::thread queued([&] {
+        drive::CurlSession next_operation;
+        const auto cancelled = next_operation.request(request, {&queued_cancel, {}});
+        assert(!cancelled.transport_ok && cancelled.error == "Operation cancelled.");
+    });
+    queued_cancel.store(true);
+    queued.join();
+    std::thread second([&] {
+        drive::CurlSession next_operation;
+        next_operation.request(request, {});
+    });
+    {
+        std::lock_guard lock(request_mutex);
+        release_request = true;
+        request_wake.notify_all();
+    }
+    first.join();
+    second.join();
+    assert(peak_requests == 1 && handles_created == 2);
+    hold_request = false;
 
     std::atomic<bool> cancelled{true};
     reply = session.request(request, {&cancelled, {}});
@@ -166,5 +231,6 @@ int main() {
     assert(fs::file_size(path) < 1024);
     fs::current_path(previous);
     fs::remove_all(root);
-    std::puts("Curl handle reuse, request isolation, socket diagnostics, local I/O diagnostics, redaction, and bounded error log passed.");
+    drive::CurlSession::shutdown();
+    std::puts("Lazy shared Curl handle, cross-operation reuse, idle expiry/recreation, request isolation, socket diagnostics, and logging passed.");
 }

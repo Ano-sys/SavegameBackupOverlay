@@ -11,6 +11,11 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <condition_variable>
+#include <mutex>
+#ifndef __SWITCH__
+#include <thread>
+#endif
 #include <sys/socket.h>
 
 namespace drive {
@@ -102,7 +107,7 @@ size_t receive(char* data, size_t size, size_t count, void* context) {
     if(transfer.control.stopped()) return 0;
 
     const bool download = transfer.output && transfer.reply.status >= 200 && transfer.reply.status < 300;
-    const uint64_t limit = download ? transfer.request.transfer_size : 2 * 1024 * 1024;
+    const uint64_t limit = download ? transfer.request.transfer_size : transfer.request.response_limit;
 
     if(bytes > limit || transfer.received > limit - bytes) {
         transfer.reply.error = "Response exceeds the allowed size (" + std::to_string(limit) + " bytes).";
@@ -163,64 +168,173 @@ int progress(void* context, curl_off_t download_total, curl_off_t downloaded, cu
     else if(transfer.output) transfer.control.report("Downloading backup ...", std::max<curl_off_t>(0, downloaded), std::max<curl_off_t>(0, download_total));
     return 0;
 }
+
+// The lightweight CurlSession objects all use this one process-wide transport.
+// The mutex also protects curl callbacks and request headers from other workers.
+struct SharedNetwork {
+    using Clock = std::chrono::steady_clock;
+    std::mutex mutex;
+    std::condition_variable wake;
+    CURL* handle = nullptr;
+    bool sockets = false;
+    bool curl = false;
+    bool stopping = false;
+    Clock::time_point last_activity{};
+#ifdef __SWITCH__
+    Thread monitor{};
+    bool monitor_created = false;
+#else
+    std::thread monitor;
+#endif
+
+    ~SharedNetwork() { shutdown(); }
+
+    void close_locked() {
+        if(!handle && !curl && !sockets) return;
+        if(handle) curl_easy_cleanup(handle);
+        handle = nullptr;
+        if(curl) curl_global_cleanup();
+        curl = false;
+#ifdef __SWITCH__
+        if(sockets) socketExit();
+#endif
+        sockets = false;
+        backup::log_memory("after shared network cleanup");
+    }
+
+    bool expire_locked(Clock::time_point now) {
+        if(!handle || now - last_activity < CurlSession::IdleTimeout) return false;
+        close_locked();
+        return true;
+    }
+
+    void maintain() {
+        std::unique_lock lock(mutex);
+        while(!stopping) {
+            if(!handle) wake.wait(lock, [&] { return stopping || handle; });
+            else {
+                wake.wait_until(lock, last_activity + CurlSession::IdleTimeout);
+                if(!stopping) expire_locked(Clock::now());
+            }
+        }
+    }
+
+    bool start_monitor(std::string& error) {
+#ifdef __SWITCH__
+        if(monitor_created) return true;
+        Result rc = threadCreate(&monitor, [](void* context) { static_cast<SharedNetwork*>(context)->maintain(); }, this, nullptr, 0x8000, 0x2C, -2);
+        if(R_SUCCEEDED(rc)) {
+            monitor_created = true;
+            rc = threadStart(&monitor);
+            if(R_FAILED(rc)) {
+                if(R_SUCCEEDED(threadClose(&monitor))) monitor_created = false;
+                else stopping = true;
+            }
+        }
+        if(R_FAILED(rc)) {
+            error = "Could not start the network idle timer (Result " + std::to_string(rc) + ").";
+            return false;
+        }
+#else
+        (void)error;
+        if(!monitor.joinable()) monitor = std::thread([this] { maintain(); });
+#endif
+        return true;
+    }
+
+    bool initialize(std::string& error) {
+        // Also enforce expiry if the overlay was suspended while idle.
+        expire_locked(Clock::now());
+        if(handle) return true;
+        backup::log_memory("before shared socket initialization");
+#ifdef __SWITCH__
+        const SocketInitConfig settings = {
+            .tcp_tx_buf_size = 0x4000,
+            .tcp_rx_buf_size = 0x4000,
+            .tcp_tx_buf_max_size = 0,
+            .tcp_rx_buf_max_size = 0,
+            .udp_tx_buf_size = 0x1000,
+            .udp_rx_buf_size = 0x1000,
+            // Keep this contiguous 160 KiB block across operations.
+            .sb_efficiency = 4,
+            .num_bsd_sessions = 1,
+            .bsd_service_type = BsdServiceType_Auto,
+        };
+        const Result rc = socketInitialize(&settings);
+        sockets = R_SUCCEEDED(rc);
+        if(!sockets) {
+            const auto reason = rc == MAKERESULT(Module_Libnx, LibnxError_OutOfMemory) ? "out of memory" : "service error";
+            error = "Socket initialization failed: " + std::string(reason) + " (Result " + std::to_string(rc) + ", " + result_code(rc) + ").";
+            backup::log_memory("after failed shared socket initialization");
+            return false;
+        }
+#endif
+        const auto result = curl_global_init(CURL_GLOBAL_DEFAULT);
+        curl = result == CURLE_OK;
+        if(!curl) error = "curl_global_init failed (curl " + std::to_string(result) + "): " + curl_easy_strerror(result);
+        else {
+            handle = curl_easy_init();
+            if(!handle) error = "curl_easy_init failed. No request was sent.";
+        }
+        if(!handle || !start_monitor(error)) {
+            close_locked();
+            return false;
+        }
+        backup::log_memory("after shared network initialization");
+        return true;
+    }
+
+    void shutdown() {
+        {
+            std::lock_guard lock(mutex);
+            stopping = true;
+            wake.notify_all();
+        }
+        bool stopped = true;
+#ifdef __SWITCH__
+        if(monitor_created) {
+            Result rc = threadWaitForExit(&monitor);
+            if(R_SUCCEEDED(rc)) rc = threadClose(&monitor);
+            stopped = R_SUCCEEDED(rc);
+            if(stopped) monitor_created = false;
+            else backup::log_error("Could not release the network idle timer (Result " + std::to_string(rc) + ").");
+        }
+#else
+        if(monitor.joinable()) monitor.join();
+#endif
+        std::lock_guard lock(mutex);
+        close_locked();
+        stopping = !stopped;
+    }
+};
+
+SharedNetwork& shared_network() {
+    static SharedNetwork network;
+    return network;
+}
+
+struct TouchNetwork {
+    SharedNetwork& network;
+    ~TouchNetwork() {
+        network.last_activity = SharedNetwork::Clock::now();
+        network.wake.notify_all();
+    }
+};
 } // namespace
 
-CurlSession::CurlSession() {
-    backup::log_memory("before socket initialization");
-#ifdef __SWITCH__
-    const SocketInitConfig settings = {
-        .tcp_tx_buf_size = 0x4000,
-        .tcp_rx_buf_size = 0x4000,
-        .tcp_tx_buf_max_size = 0,
-        .tcp_rx_buf_max_size = 0,
-        .udp_tx_buf_size = 0x1000,
-        .udp_rx_buf_size = 0x1000,
-        // Reserve 160 KiB for cached connections and a new socket.
-        .sb_efficiency = 4,
-        .num_bsd_sessions = 1,
-        .bsd_service_type = BsdServiceType_Auto,
-    };
-    const Result socket_result = socketInitialize(&settings);
-    sockets = R_SUCCEEDED(socket_result);
-
-    if(!sockets) {
-        const auto reason = socket_result == MAKERESULT(Module_Libnx, LibnxError_OutOfMemory) ? "out of memory" : "service error";
-        initialization_error = "Socket initialization failed: " + std::string(reason) + " (Result " + std::to_string(socket_result) + ", " + result_code(socket_result) + ").";
-        backup::log_memory("after failed socket initialization");
-        return;
-    }
-#endif
-    const auto result = curl_global_init(CURL_GLOBAL_DEFAULT);
-
-    if(result != CURLE_OK) {
-        initialization_error = "curl_global_init failed (curl " + std::to_string(result) + "): " + curl_easy_strerror(result);
-        return;
-    }
-
-    handle = curl_easy_init();
-    initialized = handle != nullptr;
-
-    if(!initialized) {
-        initialization_error = "curl_easy_init failed. No request was sent.";
-        curl_global_cleanup();
-    }
-    backup::log_memory("after network initialization");
+bool CurlSession::expire_idle(std::chrono::steady_clock::time_point now) {
+    auto& shared = shared_network();
+    std::unique_lock lock(shared.mutex, std::try_to_lock);
+    return lock && !shared.stopping && shared.expire_locked(now);
 }
 
-CurlSession::~CurlSession() {
-    if(handle) curl_easy_cleanup(handle);
-    if(initialized) curl_global_cleanup();
-#ifdef __SWITCH__
-    if(sockets) socketExit();
-#endif
-    backup::log_memory("after network cleanup");
-}
+void CurlSession::shutdown() { shared_network().shutdown(); }
 
 HttpReply CurlSession::request(const HttpRequest& request, const backup::Control& control) const {
     HttpReply reply;
 
-    if(!initialized || control.stopped()) {
-        reply.error = control.stopped() ? "Operation cancelled." : initialization_error;
+    if(control.stopped()) {
+        reply.error = "Operation cancelled.";
         return reply;
     }
 
@@ -247,6 +361,27 @@ HttpReply CurlSession::request(const HttpRequest& request, const backup::Control
             return reply;
         }
     }
+
+    auto& shared = shared_network();
+    std::unique_lock lock(shared.mutex, std::defer_lock);
+    while(!lock.try_lock()) {
+        if(control.stopped()) {
+            reply.error = "Operation cancelled.";
+            return reply;
+        }
+#ifdef __SWITCH__
+        svcSleepThread(10'000'000);
+#else
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+#endif
+    }
+    if(control.stopped() || shared.stopping) {
+        reply.error = "Operation cancelled.";
+        return reply;
+    }
+    if(!shared.initialize(reply.error)) return reply;
+    const TouchNetwork touch{shared};
+    CURL* handle = shared.handle;
 
     Transfer transfer{request, control, reply, output.get()};
     transfer.input = input.get();
@@ -276,8 +411,12 @@ HttpReply CurlSession::request(const HttpRequest& request, const backup::Control
     set_option(CURLOPT_OPENSOCKETDATA, &socket_diagnostic);
     set_option(CURLOPT_HTTPHEADER, headers);
     set_option(CURLOPT_MAXCONNECTS, 2L);
-    set_option(CURLOPT_CONNECTTIMEOUT, 10L);
-    set_option(CURLOPT_TIMEOUT, input || output ? 1800L : 30L);
+#if LIBCURL_VERSION_NUM >= 0x074100
+    set_option(CURLOPT_MAXAGE_CONN, 300L);
+#endif
+    set_option(CURLOPT_CONNECTTIMEOUT, request.connect_timeout_seconds);
+    set_option(CURLOPT_TIMEOUT, request.timeout_seconds > 0 ? request.timeout_seconds : input || output ? 1800L
+                                                                                                        : 30L);
     set_option(CURLOPT_LOW_SPEED_LIMIT, 1L);
     set_option(CURLOPT_LOW_SPEED_TIME, 30L);
     set_option(CURLOPT_NOSIGNAL, 1L);
