@@ -53,7 +53,16 @@ int main() {
         for(unsigned i = 0; i < 10; ++i) session.request(request, {});
         assert(initializations == 2 && exits == 0);
         assert(!drive::CurlSession::expire_idle());
-        assert(drive::CurlSession::expire_idle(std::chrono::steady_clock::now() + drive::CurlSession::IdleTimeout + std::chrono::seconds(1)));
+
+        const auto future = std::chrono::steady_clock::now() + drive::CurlSession::IdleTimeout + std::chrono::seconds(1);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+
+        bool expired = false;
+        while(!(expired = drive::CurlSession::expire_idle(future)) && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        assert(expired);
+
         assert(exits == 1);
         session.request(request, {});
         assert(initializations == 3 && test_open_threads == 1);

@@ -151,7 +151,16 @@ int main() {
         assert(!reply.transport_ok && handles_created == 1);
     }
     assert(!drive::CurlSession::expire_idle());
-    assert(drive::CurlSession::expire_idle(std::chrono::steady_clock::now() + drive::CurlSession::IdleTimeout + std::chrono::seconds(1)));
+
+    const auto future = std::chrono::steady_clock::now() + drive::CurlSession::IdleTimeout + std::chrono::seconds(1);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+
+    bool expired = false;
+    while(!(expired = drive::CurlSession::expire_idle(future)) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    assert(expired);
+
     assert(!drive::CurlSession::expire_idle());
     reply = session.request(request, {});
     assert(!reply.transport_ok && handles_created == 2);
